@@ -232,32 +232,68 @@ Changing the **embedding model** re-indexes every item in the background: vector
 
 ## Architecture
 
+### System
+
+```mermaid
+flowchart LR
+    UI["React app<br/>Vite, port 5173"] -->|"/api proxy"| API["FastAPI<br/>port 8000"]
+    API --> ING["Ingestion<br/>background task"]
+    API --> ANS["Question answering"]
+    ING -->|"fetch URL, SSRF-guarded"| WEB["Web pages"]
+    ING -->|"embed chunks"| LLM["Model provider<br/>OpenAI · Gemini · OpenAI-compatible"]
+    ANS -->|"rewrite, embed, answer"| LLM
+    ING --> DB[("SQLite<br/>items · chunks + vectors<br/>keyword index · chats")]
+    ANS --> DB
 ```
-React ── /api proxy ──► FastAPI
-                          │
-  POST /ingest ──► validate ─► dedupe ─► INSERT item (pending) ─► 202
-                                   │
-                                   └─► background task:
-                                       fetch URL* ─► extract text ─► chunk ─► embed (batches of 64) ─► store ─► ready | failed
-                                                                                 * SSRF-guarded
-  POST /ingest/file ──► extract text (PDF, DOCX, TXT, MD) ─► same path as a note
 
-  POST /query ──► follow-up in a chat? rewrite it as a standalone question (one small LLM call)
-              ──► question about the whole library? ─► opening passage of each item
-              ──► otherwise hybrid search:
-                    vectors:  cosine top-50, kept if ≥ MIN_SCORE ─┐
-                    keywords: BM25 top-50 (FTS5)                ─┴─► Reciprocal Rank Fusion ─► top-k
-              ──► nothing found? "couldn't find that" (no LLM call)
-              ──► numbered sources ─► LLM ─► parse [n] ─► answer + cited sources
-  POST /query/stream ── same steps ─► SSE: thread ─► sources ─► tokens ─► done | error ─► saved to the chat
+### Adding an item
 
-SQLite
+```mermaid
+flowchart TD
+    A["POST /ingest<br/>note or URL"] --> B["Validate + dedupe"]
+    X["POST /ingest/file<br/>PDF · DOCX · TXT · MD"] --> T["Extract text"] --> B
+    B --> C["Save item as pending<br/>return 202"]
+    C --> D["Background: fetch URL,<br/>extract main text"]
+    D --> E["Chunk<br/>1,200 chars, 200 overlap"]
+    E --> G["Embed in batches of 64"]
+    G --> H["Store chunks + vectors<br/>status: ready"]
+    D -. "error" .-> I["status: failed,<br/>with the reason"]
+```
+
+### Answering a question
+
+```mermaid
+flowchart TD
+    Q["Question"] --> R{"Follow-up in a chat?"}
+    R -->|yes| RW["Rewrite as a standalone question<br/>one small LLM call"]
+    R -->|no| O{"About the whole library?"}
+    RW --> O
+    O -->|yes| OV["Opening passage of each item<br/>12 most recent"]
+    O -->|no| V["Vector search<br/>cosine top-50, kept if ≥ MIN_SCORE"]
+    O -->|no| K["Keyword search<br/>BM25 top-50, SQLite FTS5"]
+    V --> F["Reciprocal Rank Fusion<br/>top-k passages"]
+    K --> F
+    F --> N{"Anything found?"}
+    N -->|no| NF["'I couldn't find that'<br/>no LLM call"]
+    N -->|yes| P["Numbered sources + prompt"]
+    OV --> P
+    P --> L["LLM writes the answer<br/>streamed to the browser"]
+    L --> C["Parse [n] citations<br/>keep only cited sources"]
+    C --> S["Saved to the chat"]
+```
+
+### Data
+
+```
+SQLite (one file: backend/data/inbox.db)
   items      (id, source_type note|url|file, title, url UNIQUE, raw_content, content_hash, status, error, timestamps)
   chunks     (id, item_id → items ON DELETE CASCADE, position, text, embedding BLOB float32, embedding_model)
   chunks_fts (FTS5 keyword index: item title + kind + chunk text, porter stemming; synced by triggers)
   threads    (id, title, created_at, updated_at)
   messages   (id, thread_id → threads ON DELETE CASCADE, role, content, status, sources JSON, meta JSON)
 ```
+
+### Code layout
 
 ```
 backend/app/
